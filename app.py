@@ -112,10 +112,11 @@ def extrair_ata_sessao(pdf_file, itens_validos, lote_marca_map):
                     
                     razao_social = " ".join(rs_parts).strip()
                     
-                    # Regex Sanitizer para Razão Social
+                    # Limpeza Rigorosa da Razão Social
                     razao_social = re.sub(r'^\d+\s+', '', razao_social)
                     razao_social = re.sub(r'\b(Dif\.|%\s*ME|ME|Sim|Não)\b', '', razao_social, flags=re.IGNORECASE)
                     razao_social = re.sub(r'\(%\)', '', razao_social)
+                    # Remove frações perdidas tipo "12,8063" ou valores monetários no meio do nome
                     razao_social = re.sub(r'\d+,\d+', '', razao_social)
                     razao_social = razao_social.strip()
                         
@@ -144,13 +145,17 @@ def extrair_ata_sessao(pdf_file, itens_validos, lote_marca_map):
                     
                     marca = lote_marca_map.get(current_lote, {}).get(num, "")
                     
+                    # Identifica se a empresa tem flag de desconsiderada (DESCLASSIFICADA ou INABILITADA)
+                    desconsiderar = "SIM" if mode in ['DESCLASSIFICADOS', 'INABILITADOS'] else ""
+                    
                     resultados.append({
                         'Lote': current_lote,
                         'Razão Social': razao_social,
                         'CNPJ': cnpj,
                         'Oferta Final': oferta_final,
                         'Porte': me_str,
-                        'Marca': marca
+                        'Marca': marca,
+                        'Desconsiderado': desconsiderar
                     })
         i += 1
     return resultados
@@ -167,8 +172,9 @@ def gerar_mapa_excel(resultados, df_cadastro):
         qtde = float(row_item['Quantidade'])
         desc = row_item['--------------------------------- D i s c r i m i n a ç ã o ---------------------------------']
         
+        # Linha Pai do Item
         mapa.append({
-            'MAPA': 22105,
+            'MAPA': 'MAPA',
             'Posição': f'Item {lote}',
             'Item': lote,
             'Código': '',
@@ -185,9 +191,13 @@ def gerar_mapa_excel(resultados, df_cadastro):
             'Desconsiderado': ''
         })
         
+        # Filtra os participantes do lote
         lote_results = [r for r in resultados if r['Lote'] == lote]
+        
+        # Ordenação rigorosa e única (do menor valor para o maior)
         lote_results.sort(key=lambda x: x['Oferta Final'])
         
+        # Linhas Filhas (Concorrentes)
         for idx, r in enumerate(lote_results):
             vt = r['Oferta Final'] * qtde if r['Oferta Final'] != float('inf') else None
             vu = r['Oferta Final'] if r['Oferta Final'] != float('inf') else None
@@ -206,23 +216,18 @@ def gerar_mapa_excel(resultados, df_cadastro):
                 'Quantidade': '',
                 'Valor unitário': vu,
                 'Valor total': vt,
-                'Mapa': 22105,
-                'Desconsiderado': ''
+                'Mapa': '',
+                'Desconsiderado': r['Desconsiderado']
             })
 
     df_mapa = pd.DataFrame(mapa)
     
-    header_row1 = ['MAPA', 22105, '86/2026', 'FUNDO M. DE SAÚDE DE RIO VERDE'] + [''] * 10
-    header_row2 = ['Posição', 'Item', 'Código', 'Descrição', 'CNPJ', 'Empresa', 'Porte', 'Marca', 'Modelo', 'Quantidade', 'Valor unitário', 'Valor total', 'Mapa', 'Desconsiderado']
-
-    df_mapa_final = pd.DataFrame(columns=header_row2)
-    for idx, row in df_mapa.iterrows():
-        df_mapa_final.loc[idx] = [row.get(c, '') for c in header_row2]
-        
+    # Cabeçalho Definitivo Simples (Remove a primeira linha de lixo que o Pandas gerava antes)
+    colunas_finais = ['MAPA', 'Posição', 'Item', 'Código', 'Descrição', 'CNPJ', 'Empresa', 'Porte', 'Marca', 'Modelo', 'Quantidade', 'Valor unitário', 'Valor total', 'Mapa', 'Desconsiderado']
+    
     output = BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        pd.DataFrame([header_row1]).to_excel(writer, header=False, index=False, startrow=0)
-        df_mapa_final.to_excel(writer, header=True, index=False, startrow=1)
+        df_mapa.to_excel(writer, columns=colunas_finais, index=False)
         
     return output.getvalue()
 
