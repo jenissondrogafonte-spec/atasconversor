@@ -112,11 +112,10 @@ def extrair_ata_sessao(pdf_file, itens_validos, lote_marca_map):
                     
                     razao_social = " ".join(rs_parts).strip()
                     
-                    # Limpeza Rigorosa da Razão Social
+                    # Regex de Limpeza (Sanitização da Razão Social)
                     razao_social = re.sub(r'^\d+\s+', '', razao_social)
                     razao_social = re.sub(r'\b(Dif\.|%\s*ME|ME|Sim|Não)\b', '', razao_social, flags=re.IGNORECASE)
                     razao_social = re.sub(r'\(%\)', '', razao_social)
-                    # Remove frações perdidas tipo "12,8063" ou valores monetários no meio do nome
                     razao_social = re.sub(r'\d+,\d+', '', razao_social)
                     razao_social = razao_social.strip()
                         
@@ -145,7 +144,7 @@ def extrair_ata_sessao(pdf_file, itens_validos, lote_marca_map):
                     
                     marca = lote_marca_map.get(current_lote, {}).get(num, "")
                     
-                    # Identifica se a empresa tem flag de desconsiderada (DESCLASSIFICADA ou INABILITADA)
+                    # Marca se a empresa foi desclassificada/inabilitada na ata original
                     desconsiderar = "SIM" if mode in ['DESCLASSIFICADOS', 'INABILITADOS'] else ""
                     
                     resultados.append({
@@ -174,7 +173,7 @@ def gerar_mapa_excel(resultados, df_cadastro):
         
         # Linha Pai do Item
         mapa.append({
-            'MAPA': 'MAPA',
+            'MAPA': 22105,
             'Posição': f'Item {lote}',
             'Item': lote,
             'Código': '',
@@ -191,13 +190,13 @@ def gerar_mapa_excel(resultados, df_cadastro):
             'Desconsiderado': ''
         })
         
-        # Filtra os participantes do lote
+        # Consolida todas as empresas do Lote (Desclassificados/Inabilitados entram na fila)
         lote_results = [r for r in resultados if r['Lote'] == lote]
         
-        # Ordenação rigorosa e única (do menor valor para o maior)
+        # Ordenação Única do Menor para o Maior Valor
         lote_results.sort(key=lambda x: x['Oferta Final'])
         
-        # Linhas Filhas (Concorrentes)
+        # Geração das Linhas Filhas (Concorrentes) aplicando a numeração sequencial
         for idx, r in enumerate(lote_results):
             vt = r['Oferta Final'] * qtde if r['Oferta Final'] != float('inf') else None
             vu = r['Oferta Final'] if r['Oferta Final'] != float('inf') else None
@@ -216,15 +215,16 @@ def gerar_mapa_excel(resultados, df_cadastro):
                 'Quantidade': '',
                 'Valor unitário': vu,
                 'Valor total': vt,
-                'Mapa': '',
+                'Mapa': '',  # Mantém vazio conforme solicitado, exceto na Linha Pai
                 'Desconsiderado': r['Desconsiderado']
             })
 
     df_mapa = pd.DataFrame(mapa)
     
-    # Cabeçalho Definitivo Simples (Remove a primeira linha de lixo que o Pandas gerava antes)
+    # Cabeçalho Exato
     colunas_finais = ['MAPA', 'Posição', 'Item', 'Código', 'Descrição', 'CNPJ', 'Empresa', 'Porte', 'Marca', 'Modelo', 'Quantidade', 'Valor unitário', 'Valor total', 'Mapa', 'Desconsiderado']
     
+    # Gera o arquivo em memória com o template solicitado
     output = BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         df_mapa.to_excel(writer, columns=colunas_finais, index=False)
@@ -245,7 +245,7 @@ with col3:
 
 if arq_cadastro and arq_propostas and arq_ata:
     if st.button("Processar Arquivos", type="primary"):
-        with st.spinner('Lendo documentos e estruturando mapa...'):
+        with st.spinner('Lendo documentos, higienizando dados e estruturando mapa...'):
             try:
                 # 1. Lê cadastro
                 df_cad = pd.read_excel(arq_cadastro)
@@ -259,7 +259,7 @@ if arq_cadastro and arq_propostas and arq_ata:
                 # 3. Gera Excel em memória
                 excel_data = gerar_mapa_excel(dados_concorrentes, df_cad)
                 
-                st.success("Conversão concluída com sucesso!")
+                st.success("Conversão concluída com sucesso! Os dados foram ordenados e higienizados.")
                 
                 # 4. Botão de Download
                 st.download_button(
