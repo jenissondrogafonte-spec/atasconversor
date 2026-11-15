@@ -2,19 +2,22 @@ import streamlit as st
 import pandas as pd
 import re
 import pdfplumber
+from pypdf import PdfReader
 from io import BytesIO
+import gc
 
 st.set_page_config(page_title="Conversor de Mapas BNC/BLL", layout="wide")
 st.title("Conversor de Mapas: Portais BNC e BLL")
 
 def extrair_marcas_propostas(pdf_file):
+    """Usa PyPDF (mais leve) para ler apenas as propostas"""
     lote_marca_map = {}
-    with pdfplumber.open(pdf_file) as pdf:
-        lines = []
-        for page in pdf.pages:
-            text = page.extract_text()
-            if text:
-                lines.extend(text.split('\n'))
+    reader = PdfReader(pdf_file)
+    lines = []
+    for page in reader.pages:
+        text = page.extract_text()
+        if text:
+            lines.extend(text.split('\n'))
 
     current_lote = None
     i = 0
@@ -51,12 +54,15 @@ def extrair_marcas_propostas(pdf_file):
     return lote_marca_map
 
 def extrair_ata_sessao(pdf_file, itens_validos, lote_marca_map):
+    """Usa pdfplumber (mais preciso visualmente) limpando o cache página a página"""
+    ata_lines = []
     with pdfplumber.open(pdf_file) as pdf:
-        ata_lines = []
         for page in pdf.pages:
             text = page.extract_text()
             if text:
                 ata_lines.extend(text.split('\n'))
+            # Mágica para não estourar a memória RAM no Render
+            page.flush_cache()
 
     resultados = []
     current_lote = None
@@ -116,11 +122,11 @@ def extrair_ata_sessao(pdf_file, itens_validos, lote_marca_map):
                     
                     razao_social = " ".join(rs_parts).strip()
                     
-                    # Limpeza Rigorosa da Razão Social (Sanitização)
-                    razao_social = re.sub(r'^\d+\s+', '', razao_social) # Remove números perdidos no início
-                    razao_social = razao_social.replace('Dif.', '').replace('Dif', '').replace('(%)', '')
-                    razao_social = re.sub(r'\b(ME|Sim|Não)\b', '', razao_social, flags=re.IGNORECASE)
-                    razao_social = re.sub(r'\d+,\d+', '', razao_social) # Remove decimais soltos
+                    # Regex de Limpeza (Sanitização da Razão Social)
+                    razao_social = re.sub(r'^\d+\s+', '', razao_social)
+                    razao_social = re.sub(r'\b(Dif\.|%\s*ME|ME|Sim|Não)\b', '', razao_social, flags=re.IGNORECASE)
+                    razao_social = re.sub(r'\(%\)', '', razao_social)
+                    razao_social = re.sub(r'\d+,\d+', '', razao_social)
                     razao_social = razao_social.strip()
                         
                     oferta_final = None
@@ -173,9 +179,8 @@ def gerar_mapa_excel(resultados, df_cadastro):
         qtde = float(row_item['Quantidade'])
         desc = row_item['--------------------------------- D i s c r i m i n a ç ã o ---------------------------------']
         
-        # Linha Pai do Item
         mapa.append({
-            'MAPA': '',
+            'MAPA': 22105,
             'Posição': f'Item {lote}',
             'Item': lote,
             'Código': '',
@@ -188,15 +193,13 @@ def gerar_mapa_excel(resultados, df_cadastro):
             'Quantidade': qtde,
             'Valor unitário': None,
             'Valor total': None,
-            'Mapa': '',
+            'Mapa': 22105,
             'Desconsiderado': ''
         })
         
-        # Filtra os participantes do lote e unifica a ordenação pelo preço final
         lote_results = [r for r in resultados if r['Lote'] == lote]
         lote_results.sort(key=lambda x: x['Oferta Final'])
         
-        # Linhas Filhas (Concorrentes)
         for idx, r in enumerate(lote_results):
             vt = r['Oferta Final'] * qtde if r['Oferta Final'] != float('inf') else None
             vu = r['Oferta Final'] if r['Oferta Final'] != float('inf') else None
@@ -224,7 +227,6 @@ def gerar_mapa_excel(resultados, df_cadastro):
     
     output = BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        # Escreve o DataFrame contendo apenas as colunas mapeadas e sem o lixo de cabeçalho duplo
         df_mapa.to_excel(writer, columns=colunas_finais, index=False)
         
     return output.getvalue()
@@ -243,19 +245,26 @@ with col3:
 
 if arq_cadastro and arq_propostas and arq_ata:
     if st.button("Processar Arquivos", type="primary"):
-        with st.spinner('Lendo documentos, higienizando dados e estruturando mapa...'):
+        with st.spinner('Lendo documentos, higienizando dados e estruturando mapa (Isso pode levar até 1 minuto)...'):
             try:
+                # 1. Lê cadastro
                 df_cad = pd.read_excel(arq_cadastro)
                 df_cad['Item'] = pd.to_numeric(df_cad['Item'], errors='coerce')
                 itens_cotados = df_cad.dropna(subset=['Item'])['Item'].astype(int).tolist()
                 
+                # 2. Executa processamento
                 dict_marcas = extrair_marcas_propostas(arq_propostas)
                 dados_concorrentes = extrair_ata_sessao(arq_ata, itens_cotados, dict_marcas)
                 
+                # 3. Gera Excel em memória
                 excel_data = gerar_mapa_excel(dados_concorrentes, df_cad)
+                
+                # 4. Libera memória forçadamente
+                gc.collect()
                 
                 st.success("Conversão concluída com sucesso! Os dados foram ordenados e higienizados.")
                 
+                # 5. Botão de Download
                 st.download_button(
                     label="📥 Baixar Planilha Convertida (XLSX)",
                     data=excel_data,
