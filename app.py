@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import re
-from pypdf import PdfReader
+import pdfplumber
 from io import BytesIO
 
 st.set_page_config(page_title="Conversor de Mapas BNC/BLL", layout="wide")
@@ -9,10 +9,12 @@ st.title("Conversor de Mapas: Portais BNC e BLL")
 
 def extrair_marcas_propostas(pdf_file):
     lote_marca_map = {}
-    reader = PdfReader(pdf_file)
-    lines = []
-    for page in reader.pages:
-        lines.extend(page.extract_text().split('\n'))
+    with pdfplumber.open(pdf_file) as pdf:
+        lines = []
+        for page in pdf.pages:
+            text = page.extract_text()
+            if text:
+                lines.extend(text.split('\n'))
 
     current_lote = None
     i = 0
@@ -49,10 +51,12 @@ def extrair_marcas_propostas(pdf_file):
     return lote_marca_map
 
 def extrair_ata_sessao(pdf_file, itens_validos, lote_marca_map):
-    reader = PdfReader(pdf_file)
-    ata_lines = []
-    for page in reader.pages:
-        ata_lines.extend(page.extract_text().split('\n'))
+    with pdfplumber.open(pdf_file) as pdf:
+        ata_lines = []
+        for page in pdf.pages:
+            text = page.extract_text()
+            if text:
+                ata_lines.extend(text.split('\n'))
 
     resultados = []
     current_lote = None
@@ -112,11 +116,11 @@ def extrair_ata_sessao(pdf_file, itens_validos, lote_marca_map):
                     
                     razao_social = " ".join(rs_parts).strip()
                     
-                    # Regex de Limpeza (Sanitização da Razão Social)
-                    razao_social = re.sub(r'^\d+\s+', '', razao_social)
-                    razao_social = re.sub(r'\b(Dif\.|%\s*ME|ME|Sim|Não)\b', '', razao_social, flags=re.IGNORECASE)
-                    razao_social = re.sub(r'\(%\)', '', razao_social)
-                    razao_social = re.sub(r'\d+,\d+', '', razao_social)
+                    # Limpeza Rigorosa da Razão Social (Sanitização)
+                    razao_social = re.sub(r'^\d+\s+', '', razao_social) # Remove números perdidos no início
+                    razao_social = razao_social.replace('Dif.', '').replace('Dif', '').replace('(%)', '')
+                    razao_social = re.sub(r'\b(ME|Sim|Não)\b', '', razao_social, flags=re.IGNORECASE)
+                    razao_social = re.sub(r'\d+,\d+', '', razao_social) # Remove decimais soltos
                     razao_social = razao_social.strip()
                         
                     oferta_final = None
@@ -143,8 +147,6 @@ def extrair_ata_sessao(pdf_file, itens_validos, lote_marca_map):
                         oferta_final = float('inf')
                     
                     marca = lote_marca_map.get(current_lote, {}).get(num, "")
-                    
-                    # Marca se a empresa foi desclassificada/inabilitada na ata original
                     desconsiderar = "SIM" if mode in ['DESCLASSIFICADOS', 'INABILITADOS'] else ""
                     
                     resultados.append({
@@ -173,7 +175,7 @@ def gerar_mapa_excel(resultados, df_cadastro):
         
         # Linha Pai do Item
         mapa.append({
-            'MAPA': 22105,
+            'MAPA': '',
             'Posição': f'Item {lote}',
             'Item': lote,
             'Código': '',
@@ -186,17 +188,15 @@ def gerar_mapa_excel(resultados, df_cadastro):
             'Quantidade': qtde,
             'Valor unitário': None,
             'Valor total': None,
-            'Mapa': 22105,
+            'Mapa': '',
             'Desconsiderado': ''
         })
         
-        # Consolida todas as empresas do Lote (Desclassificados/Inabilitados entram na fila)
+        # Filtra os participantes do lote e unifica a ordenação pelo preço final
         lote_results = [r for r in resultados if r['Lote'] == lote]
-        
-        # Ordenação Única do Menor para o Maior Valor
         lote_results.sort(key=lambda x: x['Oferta Final'])
         
-        # Geração das Linhas Filhas (Concorrentes) aplicando a numeração sequencial
+        # Linhas Filhas (Concorrentes)
         for idx, r in enumerate(lote_results):
             vt = r['Oferta Final'] * qtde if r['Oferta Final'] != float('inf') else None
             vu = r['Oferta Final'] if r['Oferta Final'] != float('inf') else None
@@ -215,18 +215,16 @@ def gerar_mapa_excel(resultados, df_cadastro):
                 'Quantidade': '',
                 'Valor unitário': vu,
                 'Valor total': vt,
-                'Mapa': '',  # Mantém vazio conforme solicitado, exceto na Linha Pai
+                'Mapa': '',
                 'Desconsiderado': r['Desconsiderado']
             })
 
     df_mapa = pd.DataFrame(mapa)
-    
-    # Cabeçalho Exato
     colunas_finais = ['MAPA', 'Posição', 'Item', 'Código', 'Descrição', 'CNPJ', 'Empresa', 'Porte', 'Marca', 'Modelo', 'Quantidade', 'Valor unitário', 'Valor total', 'Mapa', 'Desconsiderado']
     
-    # Gera o arquivo em memória com o template solicitado
     output = BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        # Escreve o DataFrame contendo apenas as colunas mapeadas e sem o lixo de cabeçalho duplo
         df_mapa.to_excel(writer, columns=colunas_finais, index=False)
         
     return output.getvalue()
@@ -247,21 +245,17 @@ if arq_cadastro and arq_propostas and arq_ata:
     if st.button("Processar Arquivos", type="primary"):
         with st.spinner('Lendo documentos, higienizando dados e estruturando mapa...'):
             try:
-                # 1. Lê cadastro
                 df_cad = pd.read_excel(arq_cadastro)
                 df_cad['Item'] = pd.to_numeric(df_cad['Item'], errors='coerce')
                 itens_cotados = df_cad.dropna(subset=['Item'])['Item'].astype(int).tolist()
                 
-                # 2. Executa processamento
                 dict_marcas = extrair_marcas_propostas(arq_propostas)
                 dados_concorrentes = extrair_ata_sessao(arq_ata, itens_cotados, dict_marcas)
                 
-                # 3. Gera Excel em memória
                 excel_data = gerar_mapa_excel(dados_concorrentes, df_cad)
                 
                 st.success("Conversão concluída com sucesso! Os dados foram ordenados e higienizados.")
                 
-                # 4. Botão de Download
                 st.download_button(
                     label="📥 Baixar Planilha Convertida (XLSX)",
                     data=excel_data,
