@@ -1,24 +1,26 @@
 import streamlit as st
 import pandas as pd
 import re
-import pdfplumber
-from pypdf import PdfReader
 from io import BytesIO
-import gc
+from pypdf import PdfReader # Substituímos pdfplumber pelo pypdf que é 10x mais leve e não estoura a RAM
 
 st.set_page_config(page_title="Conversor de Mapas BNC/BLL", layout="wide")
 st.title("Conversor de Mapas: Portais BNC e BLL")
 
-def extrair_marcas_propostas(pdf_file):
-    """Usa PyPDF (mais leve) para ler apenas as propostas"""
-    lote_marca_map = {}
+def extract_text_from_pdf(pdf_file):
+    """Extrai texto bruto do PDF usando pypdf para não consumir memória visual"""
     reader = PdfReader(pdf_file)
-    lines = []
+    text = ""
     for page in reader.pages:
-        text = page.extract_text()
-        if text:
-            lines.extend(text.split('\n'))
+        t = page.extract_text()
+        if t:
+            text += t + "\n"
+    return text
 
+def mapear_marcas_propostas(pdf_text):
+    """Cria um dicionário (Lote) -> {Num_Participante: Marca} a partir do PDF de Propostas"""
+    lote_marca_map = {}
+    lines = pdf_text.split('\n')
     current_lote = None
     i = 0
     while i < len(lines):
@@ -27,13 +29,8 @@ def extrair_marcas_propostas(pdf_file):
         if m_lote:
             current_lote = int(m_lote.group(1))
             lote_marca_map[current_lote] = {}
-        elif line == 'LOTE':
-            if i + 1 < len(lines) and re.match(r'^\d+$', lines[i+1].strip()):
-                current_lote = int(lines[i+1].strip())
-                lote_marca_map[current_lote] = {}
-                i += 1
-                
-        if line.startswith('PARTICIPANTE '):
+            
+        if line.startswith('PARTICIPANTE ') or line.startswith('PARTICIPAΝΤΕ '):
             parts = line.split()
             if len(parts) >= 2:
                 part_num = parts[1]
@@ -41,11 +38,23 @@ def extrair_marcas_propostas(pdf_file):
                 j = i + 1
                 while j < len(lines):
                     next_line = lines[j].strip()
-                    if re.match(r'^\d{1,3}(\.\d{3})*,\d+$', next_line) or next_line == '':
-                        if next_line != '':
-                            break
+                    # Para se achar outro participante ou fim
+                    if next_line.startswith('PARTICIPANTE ') or next_line.startswith('PARTICIPAΝΤΕ '):
+                        break
+                    
+                    if next_line == '':
+                        pass
                     else:
-                        brand_str += next_line + " "
+                        clean_next_line = next_line
+                        # Remove caracteres de tabela do PDF
+                        if next_line.startswith('|'):
+                            clean_next_line = next_line[1:].strip()
+                            
+                        # Se achar o preço, ignora e encerra a busca da marca
+                        if re.match(r'^\d{1,3}(\.\d{3})*,\d+$', clean_next_line) or re.match(r'^\d{1,3}(\.\d{3})*\.\d+$', clean_next_line):
+                            pass 
+                        else:
+                            brand_str += clean_next_line + " "
                     j += 1
                 if current_lote is not None:
                     lote_marca_map[current_lote][part_num] = brand_str.strip()
@@ -53,223 +62,160 @@ def extrair_marcas_propostas(pdf_file):
         i += 1
     return lote_marca_map
 
-def extrair_ata_sessao(pdf_file, itens_validos, lote_marca_map):
-    """Usa pdfplumber (mais preciso visualmente) limpando o cache página a página"""
-    ata_lines = []
-    with pdfplumber.open(pdf_file) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text()
-            if text:
-                ata_lines.extend(text.split('\n'))
-            # Mágica para não estourar a memória RAM no Render
-            page.flush_cache()
-
-    resultados = []
+def mapear_ata_sessao(pdf_text):
+    """Cria um dicionário (Lote, CNPJ) -> {'num_participante': X, 'status': Y} a partir da Ata Final"""
+    ata_lines = pdf_text.split('\n')
+    mapa_sessao = {}
     current_lote = None
     mode = None
+    
     i = 0
-
     while i < len(ata_lines):
         line = ata_lines[i].strip()
         
+        # Pega o Lote
         m_lote = re.match(r'^LOTE\s+(\d+)', line)
         if m_lote:
             current_lote = int(m_lote.group(1))
+            if current_lote not in mapa_sessao:
+                mapa_sessao[current_lote] = {}
             mode = None
-        elif line == 'LOTE':
+        elif line == 'LOTE': # Outro padrão comum do PDF
             if i + 1 < len(ata_lines) and re.match(r'^\d+', ata_lines[i+1].strip()):
                 current_lote = int(re.match(r'^\d+', ata_lines[i+1].strip()).group())
+                if current_lote not in mapa_sessao:
+                    mapa_sessao[current_lote] = {}
                 mode = None
                 i += 1
                 
-        if current_lote in itens_validos:
-            if line == 'CLASSIFICAÇÃO':
-                mode = 'CLASSIFICACAO'
-            elif line == 'DESCLASSIFICADOS':
-                mode = 'DESCLASSIFICADOS'
-            elif line == 'INABILITADOS':
-                mode = 'INABILITADOS'
-            elif line == 'MOVIMENTOS DO LOTE' or line.startswith('01/10/2026'):
-                mode = None
+        # Status
+        if line == 'CLASSIFICAÇÃO':
+            mode = 'CLASSIFICACAO'
+        elif line == 'DESCLASSIFICADOS':
+            mode = 'DESCLASSIFICADOS'
+        elif line == 'INABILITADOS':
+            mode = 'INABILITADOS'
+        elif line == 'MOVIMENTOS DO LOTE' or line.startswith('01/10/2026'):
+            mode = None
+            
+        if mode in ['CLASSIFICACAO', 'DESCLASSIFICADOS', 'INABILITADOS']:
+            # Procurar CNPJ na linha
+            m_cnpj = re.search(r'\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}', line)
+            if m_cnpj and current_lote is not None:
+                cnpj = m_cnpj.group()
                 
-            if mode in ['CLASSIFICACAO', 'DESCLASSIFICADOS', 'INABILITADOS']:
-                m_cnpj = re.search(r'\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}', line)
-                if m_cnpj:
-                    cnpj = m_cnpj.group()
-                    
-                    window = [ata_lines[max(0, i-k)].strip() for k in range(5, -1, -1)]
-                    idx_cnpj = 5
-                    idx_num = idx_cnpj - 1
-                    num = None
-                    
-                    m_num = re.search(r'\b(\d{3})\b', window[idx_num])
-                    if m_num:
+                # Janela de leitura: 2 linhas anteriores e a atual para achar o num do participante (3 dígitos)
+                window = [ata_lines[max(0, i-k)].strip() for k in range(2, -1, -1)]
+                num = None
+                
+                for w_line in window:
+                    clean_w = w_line
+                    if clean_w.startswith('|'):
+                        clean_w = clean_w[1:].strip()
+                        
+                    m_num = re.search(r'\b(\d{3})\b', clean_w)
+                    if m_num and not num:
                         num = m_num.group(1)
-                    else:
-                        m_num = re.search(r'\b(\d{3})\b', window[idx_num-1])
-                        if m_num:
-                            num = m_num.group(1)
-                            idx_num -= 1
-                    
-                    rs_parts = []
-                    for k in range(idx_num-1, -1, -1):
-                        txt = window[k]
-                        if mode == 'CLASSIFICACAO' and re.match(r'^\d+$', txt):
-                            break
-                        if mode != 'CLASSIFICACAO' and (re.match(r'^\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}', txt) or txt in ['Sim', 'Não']):
-                            break
-                        rs_parts.insert(0, txt)
-                    
-                    razao_social = " ".join(rs_parts).strip()
-                    
-                    # Regex de Limpeza (Sanitização da Razão Social)
-                    razao_social = re.sub(r'^\d+\s+', '', razao_social)
-                    razao_social = re.sub(r'\b(Dif\.|%\s*ME|ME|Sim|Não)\b', '', razao_social, flags=re.IGNORECASE)
-                    razao_social = re.sub(r'\(%\)', '', razao_social)
-                    razao_social = re.sub(r'\d+,\d+', '', razao_social)
-                    razao_social = razao_social.strip()
-                        
-                    oferta_final = None
-                    me_str = None
-                    j = i + 1
-                    ofertas = []
-                    while j < min(i + 8, len(ata_lines)):
-                        n_line = ata_lines[j].strip()
-                        if n_line in ['Sim', 'Não']:
-                            me_str = 'ME/EPP' if n_line == 'Sim' else 'Grande Porte'
-                            break
-                        if re.match(r'^\d{1,3}(\.\d{3})*,\d+$', n_line):
-                            ofertas.append(n_line)
-                        j += 1
-                    
-                    if len(ofertas) >= 2:
-                        oferta_final = ofertas[1]
-                    elif len(ofertas) == 1:
-                        oferta_final = ofertas[0]
-                        
-                    if oferta_final:
-                        oferta_final = float(oferta_final.replace('.', '').replace(',', '.'))
-                    else:
-                        oferta_final = float('inf')
-                    
-                    marca = lote_marca_map.get(current_lote, {}).get(num, "")
-                    desconsiderar = "SIM" if mode in ['DESCLASSIFICADOS', 'INABILITADOS'] else ""
-                    
-                    resultados.append({
-                        'Lote': current_lote,
-                        'Razão Social': razao_social,
-                        'CNPJ': cnpj,
-                        'Oferta Final': oferta_final,
-                        'Porte': me_str,
-                        'Marca': marca,
-                        'Desconsiderado': desconsiderar
-                    })
+                
+                if num:
+                    mapa_sessao[current_lote][cnpj] = {
+                        'num_participante': num,
+                        'status': mode
+                    }
         i += 1
-    return resultados
-
-def gerar_mapa_excel(resultados, df_cadastro):
-    map_itens = {row['Item']: row for _, row in df_cadastro.dropna(subset=['Item']).iterrows()}
-    mapa = []
-    
-    for lote in sorted(list(set(r['Lote'] for r in resultados))):
-        if lote not in map_itens:
-            continue
-            
-        row_item = map_itens[lote]
-        qtde = float(row_item['Quantidade'])
-        desc = row_item['--------------------------------- D i s c r i m i n a ç ã o ---------------------------------']
-        
-        mapa.append({
-            'MAPA': 22105,
-            'Posição': f'Item {lote}',
-            'Item': lote,
-            'Código': '',
-            'Descrição': desc,
-            'CNPJ': '',
-            'Empresa': '',
-            'Porte': '',
-            'Marca': '',
-            'Modelo': '',
-            'Quantidade': qtde,
-            'Valor unitário': None,
-            'Valor total': None,
-            'Mapa': 22105,
-            'Desconsiderado': ''
-        })
-        
-        lote_results = [r for r in resultados if r['Lote'] == lote]
-        lote_results.sort(key=lambda x: x['Oferta Final'])
-        
-        for idx, r in enumerate(lote_results):
-            vt = r['Oferta Final'] * qtde if r['Oferta Final'] != float('inf') else None
-            vu = r['Oferta Final'] if r['Oferta Final'] != float('inf') else None
-            
-            mapa.append({
-                'MAPA': '',
-                'Posição': f"{idx + 1}º",
-                'Item': '',
-                'Código': '',
-                'Descrição': '',
-                'CNPJ': r['CNPJ'],
-                'Empresa': r['Razão Social'],
-                'Porte': r['Porte'],
-                'Marca': r['Marca'],
-                'Modelo': '',
-                'Quantidade': '',
-                'Valor unitário': vu,
-                'Valor total': vt,
-                'Mapa': '',
-                'Desconsiderado': r['Desconsiderado']
-            })
-
-    df_mapa = pd.DataFrame(mapa)
-    colunas_finais = ['MAPA', 'Posição', 'Item', 'Código', 'Descrição', 'CNPJ', 'Empresa', 'Porte', 'Marca', 'Modelo', 'Quantidade', 'Valor unitário', 'Valor total', 'Mapa', 'Desconsiderado']
-    
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df_mapa.to_excel(writer, columns=colunas_finais, index=False)
-        
-    return output.getvalue()
+    return mapa_sessao
 
 
 # --- INTERFACE DO STREAMLIT ---
-st.write("Faça o upload dos arquivos extraídos do portal para gerar a planilha no modelo unificado.")
+st.write("Faça o upload da Tabela Mestra (Excel) e das Atas de Enriquecimento (PDFs).")
 
 col1, col2, col3 = st.columns(3)
 with col1:
-    arq_cadastro = st.file_uploader("1. Planilha de Cadastro (XLSX)", type=["xlsx"])
+    arq_resultado = st.file_uploader("1. Excel Mestre (Resultados)", type=["xlsx"])
 with col2:
-    arq_propostas = st.file_uploader("2. Ata de Propostas (PDF)", type=["pdf"])
+    arq_propostas = st.file_uploader("2. PDF (Propostas do Processo)", type=["pdf"])
 with col3:
-    arq_ata = st.file_uploader("3. Ata da Sessão (PDF)", type=["pdf"])
+    arq_ata = st.file_uploader("3. PDF (Ata da Sessão)", type=["pdf"])
 
-if arq_cadastro and arq_propostas and arq_ata:
-    if st.button("Processar Arquivos", type="primary"):
-        with st.spinner('Lendo documentos, higienizando dados e estruturando mapa (Isso pode levar até 1 minuto)...'):
+if arq_resultado and arq_propostas and arq_ata:
+    if st.button("Processar Arquivos (Arquitetura Otimizada)", type="primary"):
+        with st.spinner('Realizando cruzamento de dados inteligente. Isso deve levar apenas alguns segundos...'):
             try:
-                # 1. Lê cadastro
-                df_cad = pd.read_excel(arq_cadastro)
-                df_cad['Item'] = pd.to_numeric(df_cad['Item'], errors='coerce')
-                itens_cotados = df_cad.dropna(subset=['Item'])['Item'].astype(int).tolist()
+                # 1. Extração de Texto Leve dos PDFs
+                texto_propostas = extract_text_from_pdf(arq_propostas)
+                texto_ata = extract_text_from_pdf(arq_ata)
                 
-                # 2. Executa processamento
-                dict_marcas = extrair_marcas_propostas(arq_propostas)
-                dados_concorrentes = extrair_ata_sessao(arq_ata, itens_cotados, dict_marcas)
+                # 2. Construção dos Dicionários de Memória
+                dict_marcas = mapear_marcas_propostas(texto_propostas)
+                dict_sessao = mapear_ata_sessao(texto_ata)
                 
-                # 3. Gera Excel em memória
-                excel_data = gerar_mapa_excel(dados_concorrentes, df_cad)
+                # 3. Leitura do Arquivo Mestre (Excel)
+                df_mestre = pd.read_excel(arq_resultado)
                 
-                # 4. Libera memória forçadamente
-                gc.collect()
+                # Garante que as colunas alvo existam
+                if 'Marca' not in df_mestre.columns:
+                    df_mestre['Marca'] = ''
+                if 'Desconsiderado' not in df_mestre.columns:
+                    df_mestre['Desconsiderado'] = ''
+                if 'Posição' not in df_mestre.columns: # Caso a planilha mestre seja bruta
+                    df_mestre['Posição'] = ''
+                if 'MAPA' not in df_mestre.columns:
+                    df_mestre['MAPA'] = ''
+                    
+                # 4. Merge e Enriquecimento das Linhas
+                current_lote = None
                 
-                st.success("Conversão concluída com sucesso! Os dados foram ordenados e higienizados.")
+                for idx, row in df_mestre.iterrows():
+                    # Descobre em que lote a linha está ancorada
+                    if pd.notna(row.get('Item')) and str(row.get('Item')).strip() != '':
+                        try:
+                            current_lote = int(float(str(row['Item']).strip()))
+                        except:
+                            pass
+                            
+                    cnpj = str(row.get('CNPJ', '')).strip()
+                    
+                    if current_lote and re.match(r'\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}', cnpj):
+                        # Temos um lote ativo e um CNPJ válido na linha
+                        participante_info = dict_sessao.get(current_lote, {}).get(cnpj)
+                        
+                        if participante_info:
+                            num_part = participante_info['num_participante']
+                            status = participante_info['status']
+                            
+                            # Define o Status (Desconsiderado)
+                            if status in ['DESCLASSIFICADOS', 'INABILITADOS']:
+                                df_mestre.at[idx, 'Desconsiderado'] = 'SIM'
+                            else:
+                                df_mestre.at[idx, 'Desconsiderado'] = ''
+                                
+                            # Define a Marca
+                            marca_encontrada = dict_marcas.get(current_lote, {}).get(num_part, '')
+                            df_mestre.at[idx, 'Marca'] = marca_encontrada
+
+                # 5. Higienização e Formatação Final
+                colunas_desejadas = ['MAPA', 'Posição', 'Item', 'Código', 'Descrição', 'CNPJ', 'Empresa', 'Porte', 'Marca', 'Modelo', 'Quantidade', 'Valor unitário', 'Valor total', 'Mapa', 'Desconsiderado']
                 
-                # 5. Botão de Download
+                # Preenche com colunas vazias se a planilha mestre não tiver alguma do layout
+                for col in colunas_desejadas:
+                    if col not in df_mestre.columns:
+                        df_mestre[col] = ''
+                        
+                df_final = df_mestre[colunas_desejadas]
+                
+                # Gera o Excel de saída
+                output = BytesIO()
+                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                    df_final.to_excel(writer, index=False)
+                    
+                excel_data = output.getvalue()
+                
+                st.success("Cruzamento concluído com sucesso e arquivo final enriquecido!")
                 st.download_button(
-                    label="📥 Baixar Planilha Convertida (XLSX)",
+                    label="📥 Baixar Planilha Pronta",
                     data=excel_data,
-                    file_name="mapa_bll_bnc_convertido.xlsx",
+                    file_name="mapa_cruzamento_final.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
             except Exception as e:
-                st.error(f"Ocorreu um erro durante o processamento: {e}")
+                st.error(f"Erro inesperado: {e}")
